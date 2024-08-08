@@ -8,15 +8,16 @@ jobs:
   build:
     strategy:
       matrix:
-        platform: [ ubuntu-latest ]
+        platform: [ ubuntu-latest]
         go-version: [ '1.22' ]
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: test env
+      - name: Test Env
         run: |
           echo "Tag name from GITHUB_REF_NAME: $GITHUB_REF_NAME"
           echo "Tag name from github.ref_name: ${{  github.ref_name }}"
           echo "Tag name from github.ref: ${{  github.ref }}"
+          echo "Runs name: ${{runner.os}}"
       - uses: actions/checkout@v4
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -34,7 +35,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Login to Tencent
+      - name: Login to ALiYun
         uses: docker/login-action@v3
         with:
           registry: registry.cn-hangzhou.aliyuncs.com
@@ -46,7 +47,7 @@ jobs:
           make build PROJECT_NAME=dpanel-amd64 CGO_ENABLED=1
           
           # arm64
-          curl -Lo arm64.tar.xz https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          # curl -Lo arm64.tar.xz https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           tar -xf arm64.tar.xz
           make build PROJECT_NAME=dpanel-arm64 CGO_ENABLED=1 GOARM=7 GOARCH=arm64 GOOS=linux \
           CC=${PWD}/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-gcc \
@@ -79,7 +80,8 @@ jobs:
           make build PROJECT_NAME=dpanel-musl-arm CGO_ENABLED=1 GOARM=7 GOARCH=arm GOOS=linux \
           CC=${PWD}/arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc \
           CXX=${PWD}/arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-g++
-          
+      - name: Docker BuildX
+        run: |
           docker buildx build \
           -t dpanel/dpanel:lite \
           -t dpanel/dpanel:${GITHUB_REF_NAME#v}-lite \
@@ -89,7 +91,7 @@ jobs:
           --build-arg APP_VERSION=${GITHUB_REF_NAME#v} \
           -f Dockerfile-lite \
           . --push
-          
+
           docker buildx build \
           -t dpanel/dpanel:latest \
           -t dpanel/dpanel:${GITHUB_REF_NAME#v} \
@@ -98,6 +100,37 @@ jobs:
           --platform linux/arm64,linux/amd64,linux/arm/v7 \
           --build-arg APP_VERSION=${GITHUB_REF_NAME#v} \
           . --push
+      - name: upload artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: runtime/*
+          prerelease: false
+  macos-build:
+    strategy:
+      matrix:
+        platform: [ 'macos-12', 'macos-latest' ]
+        go-version: [ '1.22' ]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Test Env
+        run: |
+          echo "Tag name from GITHUB_REF_NAME: $GITHUB_REF_NAME"
+          echo "Tag name from github.ref_name: ${{  github.ref_name }}"
+          echo "Tag name from github.ref: ${{  github.ref }}"
+          echo "Runs name: ${{runner.os}}"
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Install dependencies
+        run: |
+          go get .
+      - name: Build
+        run: |
+          make clean-source 
+          make build PROJECT_NAME=dpanel-darwin-${{runner.arch}} CGO_ENABLED=1
       - name: upload artifact
         uses: softprops/action-gh-release@v2
         with:
