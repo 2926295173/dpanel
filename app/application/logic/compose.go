@@ -2,19 +2,71 @@ package logic
 
 import (
 	"encoding/json"
-	"github.com/docker/docker/api/types/network"
+	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/donknap/dpanel/common/accessor"
+	"github.com/donknap/dpanel/common/dao"
+	"github.com/donknap/dpanel/common/entity"
+	"github.com/donknap/dpanel/common/function"
+	"github.com/donknap/dpanel/common/service/compose"
 	"github.com/donknap/dpanel/common/service/docker"
 	"github.com/donknap/dpanel/common/service/exec"
-	"os"
+	"github.com/donknap/dpanel/common/service/storage"
+	"io"
+	"io/fs"
+	"net/http"
+	"path/filepath"
 	"strings"
 )
 
+const (
+	ComposeTypeText        = "text"
+	ComposeTypeRemoteUrl   = "remoteUrl"
+	ComposeTypeServerPath  = "serverPath"
+	ComposeTypeStoragePath = "storagePath"
+)
+
 type ComposeTaskOption struct {
-	Name        string
-	Yaml        string
-	Environment []accessor.EnvItem
+	Entity      *entity.Compose
 	DeleteImage bool
+}
+
+func (self ComposeTaskOption) Compose() (*compose.Wrapper, error) {
+	options := make([]cli.ProjectOptionsFn, 0)
+	if function.IsEmptyArray(self.Entity.Setting.Environment) {
+		options = append(options, cli.WithEnv(self.Entity.Setting.GetEnvList()))
+	}
+	options = append(options, cli.WithName(self.Entity.Name))
+
+	// todo: 还需要添加覆盖配置
+
+	if self.Entity.Setting.Type == ComposeTypeServerPath {
+		options = append(options, compose.WithYamlPath(self.Entity.Yaml))
+	}
+	if self.Entity.Setting.Type == ComposeTypeStoragePath {
+		options = append(options, compose.WithYamlPath(filepath.Join(storage.Local{}.GetComposePath(), self.Entity.Yaml)))
+	}
+	if self.Entity.Setting.Type == ComposeTypeText || self.Entity.Setting.Type == "" {
+		options = append(options, compose.WithYamlString(filepath.Join(self.Entity.Name, "compose.yaml"), []byte(self.Entity.Yaml)))
+	}
+	if self.Entity.Setting.Type == ComposeTypeRemoteUrl {
+		response, err := http.Get(self.Entity.Yaml)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			_ = response.Body.Close()
+		}()
+		content, err := io.ReadAll(response.Body)
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, compose.WithYamlString(filepath.Join(self.Entity.Name, "compose.yaml"), content))
+	}
+	composer, err := compose.NewCompose(options...)
+	if err != nil {
+		return nil, nil
+	}
+	return composer, nil
 }
 
 type composeItem struct {
@@ -31,106 +83,43 @@ type Compose struct {
 }
 
 func (self Compose) Deploy(task *ComposeTaskOption) error {
-	envFile, err := self.getEnvFile(task.Environment)
+	composer, err := task.Compose()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(envFile.Name())
+	cmd := composer.GetBaseCommand()
+	self.runCommand(append(cmd, "--progress", "tty", "up", "-d"))
 
-	yamlFile, err := self.getYamlFile(task.Yaml)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(yamlFile.Name())
-
-	dockerYaml, err := docker.NewYaml(task.Yaml)
-	if err != nil {
-		return err
-	}
-	self.runCommand(append([]string{
-		"-f", yamlFile.Name(),
-		"-p", task.Name,
-		"--env-file", envFile.Name(),
-		"--progress", "tty",
-		"up",
-		"-d",
-	}, dockerYaml.GetServiceName()...))
-
-	// 部署完成后还需要把外部容器加入到对应的网络中
+	// todo 部署完成后还需要把外部容器加入到对应的网络中
 	// 如果 compose 中未指定网络，则默认的名称为 项目名_default
-	for _, item := range dockerYaml.GetExternalLinks() {
-		for _, name := range dockerYaml.GetNetworkList() {
-			err = docker.Sdk.Client.NetworkConnect(docker.Sdk.Ctx, task.Name+"_"+name, item.ContainerName, &network.EndpointSettings{})
-			if err != nil {
-				return err
-			}
-		}
-	}
+
 	return nil
 }
 
 func (self Compose) Destroy(task *ComposeTaskOption) error {
-	dockerYaml, err := docker.NewYaml(task.Yaml)
+	composer, err := task.Compose()
 	if err != nil {
 		return err
 	}
-	// 删除compose 前需要先把关联的已有容器网络退出
-	for _, item := range dockerYaml.GetExternalLinks() {
-		for _, name := range dockerYaml.GetNetworkList() {
-			err = docker.Sdk.Client.NetworkDisconnect(docker.Sdk.Ctx, task.Name+"_"+name, item.ContainerName, true)
-			if err != nil {
-				return err
-			}
-		}
-	}
+	cmd := composer.GetBaseCommand()
+	// todo 删除compose 前需要先把关联的已有容器网络退出
 
-	envFile, err := self.getEnvFile(task.Environment)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(envFile.Name())
-
-	yamlFile, err := self.getYamlFile(task.Yaml)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(yamlFile.Name())
-
-	command := []string{
-		"-f", yamlFile.Name(),
-		"-p", task.Name,
-		"--env-file", envFile.Name(),
-		"--progress",
-		"tty",
-		"down",
-	}
+	cmd = append(cmd, "--progress", "tty", "down")
 	if task.DeleteImage {
-		command = append(command, "--rmi", "all")
+		cmd = append(cmd, "--rmi", "all")
 	}
-	self.runCommand(command)
+	self.runCommand(cmd)
 	return nil
 }
 
 func (self Compose) Ctrl(task *ComposeTaskOption, op string) error {
-	envFile, err := self.getEnvFile(task.Environment)
+	composer, err := task.Compose()
 	if err != nil {
 		return err
 	}
-	defer os.Remove(envFile.Name())
+	cmd := composer.GetBaseCommand()
+	self.runCommand(append(cmd, "--progress", "tty", op))
 
-	yamlFile, err := self.getYamlFile(task.Yaml)
-	if err != nil {
-		return err
-	}
-	command := []string{
-		"-f", yamlFile.Name(),
-		"-p", task.Name,
-		"--env-file", envFile.Name(),
-		"--progress", "tty",
-		op,
-	}
-	self.runCommand(command)
-	os.Remove(yamlFile.Name())
 	return nil
 }
 
@@ -157,26 +146,19 @@ func (self Compose) Ls(projectName string) []*composeItem {
 
 func (self Compose) Ps(task *ComposeTaskOption) []*composeContainerItem {
 	result := make([]*composeContainerItem, 0)
-	if task.Name == "" || task.Yaml == "" {
+	if task.Entity.Name == "" {
 		return result
 	}
 
-	yamlFile, err := self.getYamlFile(task.Yaml)
+	composer, err := task.Compose()
 	if err != nil {
 		return result
 	}
-	defer os.Remove(yamlFile.Name())
-
-	command := []string{
-		"-f", yamlFile.Name(),
-		"-p", task.Name,
-		"ps",
-		"--format", "json",
-		"--all",
-	}
+	cmd := composer.GetBaseCommand()
+	cmd = append(cmd, "ps", "--format", "json", "--all")
 	out := exec.Command{}.RunWithOut(&exec.RunCommandOption{
 		CmdName: "docker",
-		CmdArgs: append(append(docker.Sdk.ExtraParams, "compose"), command...),
+		CmdArgs: append(append(docker.Sdk.ExtraParams, "compose"), cmd...),
 	})
 
 	if out == "" {
@@ -208,24 +190,50 @@ func (self Compose) runCommand(command []string) {
 	})
 }
 
-func (self Compose) getYamlFile(yamlContent string) (*os.File, error) {
-	yamlFile, _ := os.CreateTemp("", "dpanel-compose")
-	err := os.WriteFile(yamlFile.Name(), []byte(yamlContent), 0666)
-	if err != nil {
-		return nil, err
-	}
-	return yamlFile, nil
-}
+func (self Compose) Sync() error {
+	composeList, _ := dao.Compose.Find()
 
-func (self Compose) getEnvFile(env []accessor.EnvItem) (*os.File, error) {
-	envFile, _ := os.CreateTemp("", "dpanel-compose-env")
-	envContent := make([]string, 0)
-	for _, item := range env {
-		envContent = append(envContent, item.Name+"="+item.Value)
+	composeFileName := []string{
+		"docker-compose.yml", "docker-compose.yaml",
+		"compose.yml", "compose.yaml",
 	}
-	err := os.WriteFile(envFile.Name(), []byte(strings.Join(envContent, "\n")), 0666)
+	rootDir := storage.Local{}.GetComposePath()
+	err := filepath.Walk(rootDir, func(path string, info fs.FileInfo, err error) error {
+		for _, suffix := range composeFileName {
+			if strings.HasSuffix(path, suffix) {
+				rel, _ := filepath.Rel(rootDir, path)
+				// 只同步二级目录下的 yaml
+				if segments := strings.Split(filepath.Clean(rel), string(filepath.Separator)); len(segments) == 2 {
+					name := filepath.Dir(rel)
+
+					has := false
+					for _, item := range composeList {
+						if item.Name == name {
+							has = true
+							break
+						}
+					}
+
+					if !has {
+						dao.Compose.Create(&entity.Compose{
+							Title: "",
+							Name:  name,
+							Yaml:  rel,
+							Setting: &accessor.ComposeSettingOption{
+								Type:   ComposeTypeStoragePath,
+								Status: "waiting",
+								Uri:    rel,
+							},
+						})
+					}
+				}
+				break
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return envFile, nil
+	return nil
 }
